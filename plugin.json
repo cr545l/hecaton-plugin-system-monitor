@@ -1,0 +1,17 @@
+{
+  "id": "system-monitor",
+  "name": "System Monitor",
+  "version": "1.0.0",
+  "entry": "main.js",
+  "runtime": "node",
+  "apiVersion": { "major": 1, "minor": 0 },
+  "shortcut": { "key": "M", "mod": "ctrl+shift" },
+  "overlay": {
+    "mode": "floating",
+    "width": "70%",
+    "height": "70%",
+    "z_order": 50,
+    "resizable": false,
+    "bordered": false
+  }
+}
