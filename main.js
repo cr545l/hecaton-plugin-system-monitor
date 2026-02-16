@@ -211,10 +211,7 @@ function renderMinimized(state) {
   const d = state.data;
   let line = '';
 
-  line += colors.title + ansi.bold + ' Monitor' + ansi.reset;
-
   if (d) {
-    line += colors.dim + ' | ' + ansi.reset;
     line += colors.label + 'CPU: ' + ansi.reset;
     line += formatPercent(d.cpu.usagePercent) + ' ' + progressBar(d.cpu.usagePercent, 8);
 

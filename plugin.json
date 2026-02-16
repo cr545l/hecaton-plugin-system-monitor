@@ -12,6 +12,8 @@
     "height": "70%",
     "z_order": 50,
     "resizable": false,
-    "bordered": false
+    "bordered": false,
+    "minimized_label": "Monitor",
+    "minimized_label_color": "#50C8B4"
   }
 }
