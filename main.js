@@ -31,20 +31,20 @@ const ansi = {
   moveTo: (row, col) => `${CSI}${row};${col}H`,
 };
 
-// Color palette (teal/dark green theme)
+// Color palette (ANSI palette for theme compatibility)
 const colors = {
-  bg: ansi.bg(12, 22, 28),
-  title: ansi.fg(80, 200, 180),
-  label: ansi.fg(180, 180, 200),
-  value: ansi.fg(255, 255, 255),
-  dim: ansi.fg(90, 110, 115),
-  green: ansi.fg(120, 220, 150),
-  yellow: ansi.fg(230, 200, 100),
-  red: ansi.fg(230, 110, 110),
-  cyan: ansi.fg(100, 200, 230),
-  orange: ansi.fg(230, 170, 100),
-  border: ansi.fg(40, 80, 75),
-  separator: ansi.fg(30, 65, 60),
+  bg: CSI + '49m',            // default background
+  title: CSI + '36m',         // cyan
+  label: CSI + '39m',         // default foreground
+  value: CSI + '39m',         // default foreground
+  dim: CSI + '2m',            // SGR dim
+  green: CSI + '32m',         // green
+  yellow: CSI + '33m',        // yellow
+  red: CSI + '31m',           // red
+  cyan: CSI + '36m',          // cyan
+  orange: CSI + '33m',        // yellow
+  border: CSI + '2m',         // SGR dim
+  separator: CSI + '2m',      // SGR dim
 };
 
 function colorForPercent(pct) {
