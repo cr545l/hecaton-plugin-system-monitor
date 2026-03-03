@@ -12,6 +12,7 @@
 
 const os = require('os');
 const { execFileSync } = require('child_process');
+const { version: PLUGIN_VERSION } = require('./plugin.json');
 
 // ============================================================
 // ANSI Helpers
@@ -244,7 +245,7 @@ function render(state) {
   lines.push('');
   lines.push(centerText(
     colors.title + ansi.bold + ' System Monitor ' + ansi.reset +
-    colors.dim + 'v1.0.0' + ansi.reset,
+    colors.dim + 'v' + PLUGIN_VERSION + ansi.reset,
     width
   ));
   lines.push('');
