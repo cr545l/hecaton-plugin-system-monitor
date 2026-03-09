@@ -8,11 +8,12 @@
  * Keyboard:
  *   r / R   - Refresh data
  *   q / ESC - Close (handled by host)
+ *
+ * Uses hecaton host APIs (synchronous globals provided by deno runner).
  */
 
-const os = require('os');
-const { execFileSync } = require('child_process');
-const { version: PLUGIN_VERSION } = require('./plugin.json');
+const pluginMeta = (() => { try { const r = hecaton.fs_read_file({ path: __dirname + '/plugin.json' }); return r.ok ? JSON.parse(r.text) : {}; } catch { return {}; } })();
+const PLUGIN_VERSION = pluginMeta.version || '1.0.0';
 
 // ============================================================
 // ANSI Helpers
@@ -55,43 +56,57 @@ function colorForPercent(pct) {
 }
 
 // ============================================================
-// System Metrics
+// System Metrics (via hecaton host APIs - synchronous)
 // ============================================================
 
-let prevCpuTimes = null;
-
 function getCpuUsage() {
-  const cpus = os.cpus();
-  const current = { idle: 0, total: 0 };
-  for (const cpu of cpus) {
-    const t = cpu.times;
-    current.idle += t.idle;
-    current.total += t.user + t.nice + t.sys + t.idle + t.irq;
-  }
+  try {
+    const result = hecaton.exec_process({
+      program: 'powershell',
+      args: ['-NoProfile', '-Command',
+        '(Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors, MaxClockSpeed, LoadPercentage | ConvertTo-Json)'
+      ],
+      timeout: 5000
+    });
 
-  let usagePercent = 0;
-  if (prevCpuTimes) {
-    const idleDiff = current.idle - prevCpuTimes.idle;
-    const totalDiff = current.total - prevCpuTimes.total;
-    usagePercent = totalDiff > 0 ? ((totalDiff - idleDiff) / totalDiff) * 100 : 0;
-  }
-  prevCpuTimes = current;
+    if (result && result.ok && result.stdout) {
+      const info = JSON.parse(result.stdout.trim());
+      const cpu = Array.isArray(info) ? info[0] : info;
+      return {
+        usagePercent: cpu.LoadPercentage ?? 0,
+        model: (cpu.Name || 'Unknown').trim(),
+        cores: cpu.NumberOfLogicalProcessors || 0,
+        avgSpeedMHz: cpu.MaxClockSpeed || 0,
+      };
+    }
+  } catch { /* fallback below */ }
 
-  const model = cpus[0] ? cpus[0].model.trim() : 'Unknown';
-  const cores = cpus.length;
-  // Get per-core speeds
-  const speeds = cpus.map(c => c.speed);
-  const avgSpeed = speeds.reduce((a, b) => a + b, 0) / speeds.length;
-
-  return { usagePercent, model, cores, avgSpeedMHz: Math.round(avgSpeed) };
+  return { usagePercent: 0, model: 'Unknown', cores: 0, avgSpeedMHz: 0 };
 }
 
 function getRamUsage() {
-  const total = os.totalmem();
-  const free = os.freemem();
-  const used = total - free;
-  const usagePercent = (used / total) * 100;
-  return { total, free, used, usagePercent };
+  try {
+    const result = hecaton.exec_process({
+      program: 'powershell',
+      args: ['-NoProfile', '-Command',
+        '(Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json)'
+      ],
+      timeout: 5000
+    });
+
+    if (result && result.ok && result.stdout) {
+      const info = JSON.parse(result.stdout.trim());
+      const totalKB = info.TotalVisibleMemorySize || 0;
+      const freeKB = info.FreePhysicalMemory || 0;
+      const total = totalKB * 1024;
+      const free = freeKB * 1024;
+      const used = total - free;
+      const usagePercent = total > 0 ? (used / total) * 100 : 0;
+      return { total, free, used, usagePercent };
+    }
+  } catch { /* fallback below */ }
+
+  return { total: 0, free: 0, used: 0, usagePercent: 0 };
 }
 
 function formatBytes(bytes) {
@@ -101,52 +116,82 @@ function formatBytes(bytes) {
 }
 
 function getGpuInfo() {
-  // Try nvidia-smi first
   try {
-    const output = execFileSync('nvidia-smi', [
-      '--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed,power.draw,power.limit',
-      '--format=csv,noheader,nounits',
-    ], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 3000 });
+    const result = hecaton.exec_process({
+      program: 'nvidia-smi',
+      args: [
+        '--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed,power.draw,power.limit',
+        '--format=csv,noheader,nounits',
+      ],
+      timeout: 5000
+    });
 
-    const parseNum = (s) => { const n = parseFloat(s); return isNaN(n) ? null : n; };
-    const gpus = [];
-    for (const line of output.trim().split('\n')) {
-      const parts = line.split(',').map(s => s.trim());
-      if (parts.length >= 4) {
-        gpus.push({
-          name: parts[0],
-          usagePercent: parseNum(parts[1]) ?? 0,
-          memUsedMB: parseNum(parts[2]) ?? 0,
-          memTotalMB: parseNum(parts[3]) ?? 0,
-          tempC: parseNum(parts[4]),
-          fanPercent: parseNum(parts[5]),
-          powerDrawW: parseNum(parts[6]),
-          powerLimitW: parseNum(parts[7]),
-        });
+    if (result && result.ok && result.stdout) {
+      const parseNum = (s) => { const n = parseFloat(s); return isNaN(n) ? null : n; };
+      const gpus = [];
+      for (const line of result.stdout.trim().split('\n')) {
+        const parts = line.split(',').map(s => s.trim());
+        if (parts.length >= 4) {
+          gpus.push({
+            name: parts[0],
+            usagePercent: parseNum(parts[1]) ?? 0,
+            memUsedMB: parseNum(parts[2]) ?? 0,
+            memTotalMB: parseNum(parts[3]) ?? 0,
+            tempC: parseNum(parts[4]),
+            fanPercent: parseNum(parts[5]),
+            powerDrawW: parseNum(parts[6]),
+            powerLimitW: parseNum(parts[7]),
+          });
+        }
       }
+      if (gpus.length > 0) return gpus;
     }
-    if (gpus.length > 0) return gpus;
   } catch { /* nvidia-smi not available */ }
 
   return null;
 }
 
-function getUptimeFormatted() {
-  const totalSec = os.uptime();
-  const days = Math.floor(totalSec / 86400);
-  const hours = Math.floor((totalSec % 86400) / 3600);
-  const minutes = Math.floor((totalSec % 3600) / 60);
-  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  return `${minutes}m`;
+function getSystemInfo() {
+  const info = { osType: 'N/A', osRelease: 'N/A', hostname: 'N/A', uptimeFormatted: 'N/A' };
+
+  try {
+    const osResult = hecaton.exec_process({
+      program: 'powershell',
+      args: ['-NoProfile', '-Command',
+        '[PSCustomObject]@{ Caption=(Get-CimInstance Win32_OperatingSystem).Caption; Version=[System.Environment]::OSVersion.Version.ToString(); Hostname=[System.Environment]::MachineName; BootTime=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString("o") } | ConvertTo-Json'
+      ],
+      timeout: 5000
+    });
+
+    if (osResult && osResult.ok && osResult.stdout) {
+      const data = JSON.parse(osResult.stdout.trim());
+      info.osType = data.Caption || 'Windows';
+      info.osRelease = data.Version || '';
+      info.hostname = data.Hostname || 'N/A';
+
+      // Calculate uptime from boot time
+      if (data.BootTime) {
+        const bootTime = new Date(data.BootTime);
+        const totalSec = Math.floor((Date.now() - bootTime.getTime()) / 1000);
+        const days = Math.floor(totalSec / 86400);
+        const hours = Math.floor((totalSec % 86400) / 3600);
+        const minutes = Math.floor((totalSec % 3600) / 60);
+        if (days > 0) info.uptimeFormatted = `${days}d ${hours}h ${minutes}m`;
+        else if (hours > 0) info.uptimeFormatted = `${hours}h ${minutes}m`;
+        else info.uptimeFormatted = `${minutes}m`;
+      }
+    }
+  } catch { /* use defaults */ }
+
+  return info;
 }
 
 // ============================================================
 // Rendering
 // ============================================================
 
-let termCols = parseInt(process.env.HECA_COLS || '80', 10);
-let termRows = parseInt(process.env.HECA_ROWS || '24', 10);
+let termCols = parseInt((hecaton.get_env({ name: 'HECA_COLS' }) || {}).value || '80', 10);
+let termRows = parseInt((hecaton.get_env({ name: 'HECA_ROWS' }) || {}).value || '24', 10);
 let clickableAreas = [];
 let hoveredAreaIndex = -1;
 let currentButtons = [];
@@ -255,7 +300,7 @@ function render(state) {
   } else {
     const d = state.data;
 
-    // ── CPU ──
+    // -- CPU --
     lines.push('  ' + colors.title + ansi.bold + 'CPU' + ansi.reset);
     lines.push('  ' + drawSeparator(width - 3));
     lines.push(
@@ -275,7 +320,7 @@ function render(state) {
     );
     lines.push('');
 
-    // ── RAM ──
+    // -- RAM --
     lines.push('  ' + colors.title + ansi.bold + 'Memory' + ansi.reset);
     lines.push('  ' + drawSeparator(width - 3));
     lines.push(
@@ -293,7 +338,7 @@ function render(state) {
     );
     lines.push('');
 
-    // ── GPU ──
+    // -- GPU --
     if (d.gpus && d.gpus.length > 0) {
       for (let gi = 0; gi < d.gpus.length; gi++) {
         const gpu = d.gpus[gi];
@@ -357,19 +402,19 @@ function render(state) {
       lines.push('');
     }
 
-    // ── System ──
+    // -- System --
     lines.push('  ' + colors.title + ansi.bold + 'System' + ansi.reset);
     lines.push('  ' + drawSeparator(width - 3));
     lines.push(
       '  ' + colors.label + 'OS:     ' + ansi.reset +
-      colors.value + os.type() + ' ' + os.release() + ansi.reset
+      colors.value + d.system.osType + ' ' + d.system.osRelease + ansi.reset
     );
     lines.push(
       '  ' + colors.label + 'Uptime: ' + ansi.reset +
-      colors.value + getUptimeFormatted() + ansi.reset +
+      colors.value + d.system.uptimeFormatted + ansi.reset +
       colors.dim + '  |  ' + ansi.reset +
       colors.label + 'Host: ' + ansi.reset +
-      colors.value + os.hostname() + ansi.reset
+      colors.value + d.system.hostname + ansi.reset
     );
 
     if (state.lastRefresh) {
@@ -382,7 +427,7 @@ function render(state) {
 
     lines.push('');
 
-    // ── Keyboard ──
+    // -- Keyboard --
     lines.push('  ' + drawSeparator(width - 3));
     currentButtons = [{ label: '[r] Refresh', action: 'refresh' }];
     buttonLineIdx = lines.length;
@@ -426,19 +471,10 @@ function truncateText(text, maxLen) {
 }
 
 // ============================================================
-// JSON-RPC via stderr
-// ============================================================
-
-function sendRpc(method, params = {}, id = 1) {
-  const rpc = JSON.stringify({ jsonrpc: '2.0', method, params, id });
-  process.stderr.write('__HECA_RPC__' + rpc + '\n');
-}
-
-// ============================================================
 // Main
 // ============================================================
 
-async function main() {
+function main() {
   const state = {
     loading: true,
     data: null,
@@ -448,37 +484,40 @@ async function main() {
     minimized: false,
   };
 
-  // Initial CPU sample (first call is baseline)
-  getCpuUsage();
-
   render(state);
-
-  // Wait briefly for CPU delta to be meaningful
-  await new Promise(r => setTimeout(r, 500));
 
   function rerender() {
     if (state.minimized) renderMinimized(state);
     else render(state);
   }
 
+  let refreshing = false;
   function refresh() {
-    state.loading = false;
-    state.data = {
-      cpu: getCpuUsage(),
-      ram: getRamUsage(),
-      gpus: getGpuInfo(),
-    };
-    state.lastRefresh = Date.now();
-    state.refreshCount++;
-    rerender();
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      const cpu = getCpuUsage();
+      const ram = getRamUsage();
+      const gpus = getGpuInfo();
+      const system = getSystemInfo();
+      state.loading = false;
+      state.data = { cpu, ram, gpus, system };
+      state.lastRefresh = Date.now();
+      state.refreshCount++;
+      rerender();
+    } catch {
+      rerender();
+    } finally {
+      refreshing = false;
+    }
   }
 
   refresh();
 
-  // Auto-refresh every 3 seconds (system metrics change fast)
+  // Auto-refresh every 3 seconds
   const autoRefresh = setInterval(refresh, 3000);
 
-  // Keyboard input
+  // Keyboard / RPC input
   try {
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
   } catch { /* not a TTY */ }
@@ -494,6 +533,7 @@ async function main() {
         if (!trimmed) continue;
         try {
           const json = JSON.parse(trimmed);
+
           if (json.method === 'resize' && json.params) {
             termCols = json.params.cols || termCols;
             termRows = json.params.rows || termRows;
@@ -562,7 +602,7 @@ async function main() {
       case 'q':
       case 'Q':
         cleanup();
-        sendRpc('close');
+        hecaton.close();
         break;
     }
   });
@@ -577,7 +617,9 @@ async function main() {
   process.stdin.on('end', () => { cleanup(); process.exit(0); });
 }
 
-main().catch((e) => {
-  process.stderr.write('Error: ' + e.message + '\n');
+try {
+  main();
+} catch (e) {
+  process.stderr.write('Error: ' + (e.message || e) + '\n');
   process.exit(1);
-});
+}
