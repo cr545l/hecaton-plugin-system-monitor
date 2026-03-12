@@ -12,7 +12,7 @@
  * Uses hecaton host APIs (synchronous globals provided by deno runner).
  */
 
-const pluginMeta = (() => { try { const r = hecaton.fs_read_file({ path: __dirname + '/plugin.json' }); return r.ok ? JSON.parse(r.text) : {}; } catch { return {}; } })();
+const pluginMeta = await (async () => { try { const r = await hecaton.fs_read_file({ path: __dirname + '/plugin.json' }); return r.ok ? JSON.parse(r.text) : {}; } catch { return {}; } })();
 const PLUGIN_VERSION = pluginMeta.version || '1.0.0';
 
 // ============================================================
@@ -59,9 +59,9 @@ function colorForPercent(pct) {
 // System Metrics (via hecaton host APIs - synchronous)
 // ============================================================
 
-function getCpuUsage() {
+async function getCpuUsage() {
   try {
-    const result = hecaton.exec_process({
+    const result = await hecaton.exec_process({
       program: 'powershell',
       args: ['-NoProfile', '-Command',
         '(Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors, MaxClockSpeed, LoadPercentage | ConvertTo-Json)'
@@ -84,9 +84,9 @@ function getCpuUsage() {
   return { usagePercent: 0, model: 'Unknown', cores: 0, avgSpeedMHz: 0 };
 }
 
-function getRamUsage() {
+async function getRamUsage() {
   try {
-    const result = hecaton.exec_process({
+    const result = await hecaton.exec_process({
       program: 'powershell',
       args: ['-NoProfile', '-Command',
         '(Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json)'
@@ -115,9 +115,9 @@ function formatBytes(bytes) {
   return (bytes / 1e3).toFixed(0) + ' KB';
 }
 
-function getGpuInfo() {
+async function getGpuInfo() {
   try {
-    const result = hecaton.exec_process({
+    const result = await hecaton.exec_process({
       program: 'nvidia-smi',
       args: [
         '--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed,power.draw,power.limit',
@@ -151,11 +151,11 @@ function getGpuInfo() {
   return null;
 }
 
-function getSystemInfo() {
+async function getSystemInfo() {
   const info = { osType: 'N/A', osRelease: 'N/A', hostname: 'N/A', uptimeFormatted: 'N/A' };
 
   try {
-    const osResult = hecaton.exec_process({
+    const osResult = await hecaton.exec_process({
       program: 'powershell',
       args: ['-NoProfile', '-Command',
         '[PSCustomObject]@{ Caption=(Get-CimInstance Win32_OperatingSystem).Caption; Version=[System.Environment]::OSVersion.Version.ToString(); Hostname=[System.Environment]::MachineName; BootTime=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString("o") } | ConvertTo-Json'
@@ -190,8 +190,8 @@ function getSystemInfo() {
 // Rendering
 // ============================================================
 
-let termCols = parseInt((hecaton.get_env({ name: 'HECA_COLS' }) || {}).value || '80', 10);
-let termRows = parseInt((hecaton.get_env({ name: 'HECA_ROWS' }) || {}).value || '24', 10);
+let termCols = parseInt((await hecaton.get_env({ name: 'HECA_COLS' })).value || '80', 10);
+let termRows = parseInt((await hecaton.get_env({ name: 'HECA_ROWS' })).value || '24', 10);
 let clickableAreas = [];
 let hoveredAreaIndex = -1;
 let currentButtons = [];
@@ -492,14 +492,14 @@ function main() {
   }
 
   let refreshing = false;
-  function refresh() {
+  async function refresh() {
     if (refreshing) return;
     refreshing = true;
     try {
-      const cpu = getCpuUsage();
-      const ram = getRamUsage();
-      const gpus = getGpuInfo();
-      const system = getSystemInfo();
+      const cpu = await getCpuUsage();
+      const ram = await getRamUsage();
+      const gpus = await getGpuInfo();
+      const system = await getSystemInfo();
       state.loading = false;
       state.data = { cpu, ram, gpus, system };
       state.lastRefresh = Date.now();
