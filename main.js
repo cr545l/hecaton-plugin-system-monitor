@@ -481,10 +481,10 @@ function main() {
     startTime: Date.now(),
     lastRefresh: null,
     refreshCount: 0,
-    minimized: false,
+    minimized: hecaton.initialState?.minimized ?? false,
   };
 
-  render(state);
+  rerender();
 
   function rerender() {
     if (state.minimized) renderMinimized(state);
