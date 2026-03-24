@@ -1,7 +1,7 @@
 {
   "id": "system-monitor",
   "name": "System Monitor",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "entry": "main.js",
   "apiVersion": { "major": 1, "minor": 0 },
   "shortcut": { "key": "M", "mod": "ctrl+shift" },
