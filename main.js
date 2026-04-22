@@ -12,7 +12,7 @@
  * Uses hecaton host APIs (synchronous globals provided by deno runner).
  */
 
-const pluginMeta = await (async () => { try { const r = await hecaton.fs_read_file({ path: __dirname + '/plugin.json' }); return r.ok ? JSON.parse(r.text) : {}; } catch { return {}; } })();
+const pluginMeta = await (async () => { try { const r = await hecaton.fs.read_file({ path: __dirname + '/plugin.json' }); return r.ok ? JSON.parse(r.content) : {}; } catch { return {}; } })();
 const PLUGIN_VERSION = pluginMeta.version || '1.0.0';
 
 // ============================================================
@@ -61,12 +61,12 @@ function colorForPercent(pct) {
 
 async function getCpuUsage() {
   try {
-    const result = await hecaton.exec_process({
+    const result = await hecaton.process.exec({
       program: 'powershell',
       args: ['-NoProfile', '-Command',
         '(Get-CimInstance Win32_Processor | Select-Object Name, NumberOfLogicalProcessors, MaxClockSpeed, LoadPercentage | ConvertTo-Json)'
       ],
-      timeout: 5000
+      timeout_ms: 5000
     });
 
     if (result && result.ok && result.stdout) {
@@ -86,12 +86,12 @@ async function getCpuUsage() {
 
 async function getRamUsage() {
   try {
-    const result = await hecaton.exec_process({
+    const result = await hecaton.process.exec({
       program: 'powershell',
       args: ['-NoProfile', '-Command',
         '(Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json)'
       ],
-      timeout: 5000
+      timeout_ms: 5000
     });
 
     if (result && result.ok && result.stdout) {
@@ -117,13 +117,13 @@ function formatBytes(bytes) {
 
 async function getGpuInfo() {
   try {
-    const result = await hecaton.exec_process({
+    const result = await hecaton.process.exec({
       program: 'nvidia-smi',
       args: [
         '--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,fan.speed,power.draw,power.limit',
         '--format=csv,noheader,nounits',
       ],
-      timeout: 5000
+      timeout_ms: 5000
     });
 
     if (result && result.ok && result.stdout) {
@@ -155,12 +155,12 @@ async function getSystemInfo() {
   const info = { osType: 'N/A', osRelease: 'N/A', hostname: 'N/A', uptimeFormatted: 'N/A' };
 
   try {
-    const osResult = await hecaton.exec_process({
+    const osResult = await hecaton.process.exec({
       program: 'powershell',
       args: ['-NoProfile', '-Command',
         '[PSCustomObject]@{ Caption=(Get-CimInstance Win32_OperatingSystem).Caption; Version=[System.Environment]::OSVersion.Version.ToString(); Hostname=[System.Environment]::MachineName; BootTime=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString("o") } | ConvertTo-Json'
       ],
-      timeout: 5000
+      timeout_ms: 5000
     });
 
     if (osResult && osResult.ok && osResult.stdout) {
@@ -190,8 +190,8 @@ async function getSystemInfo() {
 // Rendering
 // ============================================================
 
-let termCols = parseInt((await hecaton.get_env({ name: 'HECA_COLS' })).value || '80', 10);
-let termRows = parseInt((await hecaton.get_env({ name: 'HECA_ROWS' })).value || '24', 10);
+let termCols = parseInt((await hecaton.env.get({ name: 'HECA_COLS' })).value || '80', 10);
+let termRows = parseInt((await hecaton.env.get({ name: 'HECA_ROWS' })).value || '24', 10);
 let clickableAreas = [];
 let hoveredAreaIndex = -1;
 let currentButtons = [];
@@ -524,16 +524,16 @@ function main() {
   process.stdin.resume();
   process.stdin.setEncoding('utf-8');
 
-  hecaton.on('resize', (params) => {
+  hecaton.on('window_resized', (params) => {
     termCols = params.cols || termCols;
     termRows = params.rows || termRows;
     rerender();
   });
-  hecaton.on('minimize', () => {
+  hecaton.on('window_minimized', () => {
     state.minimized = true;
     renderMinimized(state);
   });
-  hecaton.on('restore', () => {
+  hecaton.on('window_restored', () => {
     state.minimized = false;
     render(state);
   });
@@ -589,7 +589,7 @@ function main() {
       case 'q':
       case 'Q':
         cleanup();
-        hecaton.close();
+        hecaton.window.close();
         break;
     }
   });
