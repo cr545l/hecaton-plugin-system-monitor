@@ -59,7 +59,39 @@ function colorForPercent(pct) {
 // System Metrics (via hecaton host APIs - synchronous)
 // ============================================================
 
+async function detectPlatform() {
+  if (typeof process !== 'undefined' && process.platform) return process.platform;
+
+  try {
+    const result = await hecaton.process.exec({
+      program: 'uname',
+      args: ['-s'],
+      timeout_ms: 2000
+    });
+    const name = result?.stdout?.trim().toLowerCase();
+    if (name === 'darwin') return 'darwin';
+    if (name === 'linux') return 'linux';
+  } catch { /* use default below */ }
+
+  return 'win32';
+}
+
+const platform = await detectPlatform();
+
+async function execShell(command, timeout_ms = 5000) {
+  return hecaton.process.exec({
+    program: '/bin/sh',
+    args: ['-c', command],
+    timeout_ms
+  });
+}
+
 async function getCpuUsage() {
+  if (platform === 'darwin') return getMacCpuUsage();
+  return getWindowsCpuUsage();
+}
+
+async function getWindowsCpuUsage() {
   try {
     const result = await hecaton.process.exec({
       program: 'powershell',
@@ -84,7 +116,36 @@ async function getCpuUsage() {
   return { usagePercent: 0, model: 'Unknown', cores: 0, avgSpeedMHz: 0 };
 }
 
+async function getMacCpuUsage() {
+  try {
+    const result = await execShell([
+      'model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo Unknown)',
+      'cores=$(sysctl -n hw.logicalcpu 2>/dev/null || echo 0)',
+      'freq=$(sysctl -n hw.cpufrequency 2>/dev/null || echo 0)',
+      'usage=$(top -l 1 -n 0 -s 0 2>/dev/null | awk -F"[:,%]" \'/CPU usage/ { idle=$(NF-1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", idle); print 100-idle }\')',
+      'printf "%s\\n%s\\n%s\\n%s\\n" "$model" "${cores:-0}" "${freq:-0}" "${usage:-0}"'
+    ].join('; '));
+
+    if (result && result.ok && result.stdout) {
+      const [model, cores, freq, usage] = result.stdout.trim().split('\n');
+      return {
+        usagePercent: Number(usage) || 0,
+        model: (model || 'Unknown').trim(),
+        cores: Number(cores) || 0,
+        avgSpeedMHz: freq ? Math.round(Number(freq) / 1e6) : 0,
+      };
+    }
+  } catch { /* fallback below */ }
+
+  return { usagePercent: 0, model: 'Unknown', cores: 0, avgSpeedMHz: 0 };
+}
+
 async function getRamUsage() {
+  if (platform === 'darwin') return getMacRamUsage();
+  return getWindowsRamUsage();
+}
+
+async function getWindowsRamUsage() {
   try {
     const result = await hecaton.process.exec({
       program: 'powershell',
@@ -109,6 +170,35 @@ async function getRamUsage() {
   return { total: 0, free: 0, used: 0, usagePercent: 0 };
 }
 
+async function getMacRamUsage() {
+  try {
+    const result = await execShell([
+      'total=$(sysctl -n hw.memsize 2>/dev/null || echo 0)',
+      'vm=$(vm_stat 2>/dev/null)',
+      'page_size=$(printf "%s\\n" "$vm" | awk \'/page size of/ { gsub(/[^0-9]/, "", $0); print $0 }\')',
+      'free_pages=$(printf "%s\\n" "$vm" | awk \'/Pages free/ { gsub(/[^0-9]/, "", $0); print $0 }\')',
+      'inactive_pages=$(printf "%s\\n" "$vm" | awk \'/Pages inactive/ { gsub(/[^0-9]/, "", $0); print $0 }\')',
+      'spec_pages=$(printf "%s\\n" "$vm" | awk \'/Pages speculative/ { gsub(/[^0-9]/, "", $0); print $0 }\')',
+      'page_size=${page_size:-4096}',
+      'available_pages=$(( ${free_pages:-0} + ${inactive_pages:-0} + ${spec_pages:-0} ))',
+      'free=$(( available_pages * page_size ))',
+      'used=$(( total - free ))',
+      'printf "%s\\n%s\\n%s\\n" "$total" "$free" "$used"'
+    ].join('; '));
+
+    if (result && result.ok && result.stdout) {
+      const [totalRaw, freeRaw, usedRaw] = result.stdout.trim().split('\n');
+      const total = Math.max(0, Number(totalRaw) || 0);
+      const free = Math.max(0, Number(freeRaw) || 0);
+      const used = Math.max(0, Number(usedRaw) || 0);
+      const usagePercent = total > 0 ? (used / total) * 100 : 0;
+      return { total, free, used, usagePercent };
+    }
+  } catch { /* fallback below */ }
+
+  return { total: 0, free: 0, used: 0, usagePercent: 0 };
+}
+
 function formatBytes(bytes) {
   if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
   if (bytes >= 1e6) return (bytes / 1e6).toFixed(0) + ' MB';
@@ -116,6 +206,11 @@ function formatBytes(bytes) {
 }
 
 async function getGpuInfo() {
+  if (platform === 'darwin') return getMacGpuInfo();
+  return getNvidiaGpuInfo();
+}
+
+async function getNvidiaGpuInfo() {
   try {
     const result = await hecaton.process.exec({
       program: 'nvidia-smi',
@@ -151,9 +246,54 @@ async function getGpuInfo() {
   return null;
 }
 
+async function getMacGpuInfo() {
+  try {
+    const result = await execShell(
+      "system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model|Graphics\\/Displays|VRAM|Total Number of Cores/ { print }'",
+      8000
+    );
+
+    if (result && result.ok && result.stdout) {
+      const gpus = [];
+      let current = null;
+      for (const line of result.stdout.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('Chipset Model:')) {
+          if (current) gpus.push(current);
+          current = {
+            name: trimmed.replace('Chipset Model:', '').trim() || 'Apple GPU',
+            usagePercent: 0,
+            memUsedMB: 0,
+            memTotalMB: 0,
+            tempC: null,
+            fanPercent: null,
+            powerDrawW: null,
+            powerLimitW: null,
+          };
+        } else if (current && trimmed.startsWith('VRAM')) {
+          const mem = trimmed.match(/(\d+(?:\.\d+)?)\s*(GB|MB)/i);
+          if (mem) {
+            const value = parseFloat(mem[1]);
+            current.memTotalMB = mem[2].toUpperCase() === 'GB' ? value * 1024 : value;
+          }
+        }
+      }
+      if (current) gpus.push(current);
+      if (gpus.length > 0) return gpus;
+    }
+  } catch { /* system_profiler not available */ }
+
+  return null;
+}
+
 async function getSystemInfo() {
   const info = { osType: 'N/A', osRelease: 'N/A', hostname: 'N/A', uptimeFormatted: 'N/A' };
 
+  if (platform === 'darwin') return getMacSystemInfo(info);
+  return getWindowsSystemInfo(info);
+}
+
+async function getWindowsSystemInfo(info) {
   try {
     const osResult = await hecaton.process.exec({
       program: 'powershell',
@@ -180,6 +320,37 @@ async function getSystemInfo() {
         else if (hours > 0) info.uptimeFormatted = `${hours}h ${minutes}m`;
         else info.uptimeFormatted = `${minutes}m`;
       }
+    }
+  } catch { /* use defaults */ }
+
+  return info;
+}
+
+async function getMacSystemInfo(info) {
+  try {
+    const result = await execShell([
+      'name=$(sw_vers -productName 2>/dev/null || echo macOS)',
+      'version=$(sw_vers -productVersion 2>/dev/null || echo "")',
+      'host=$(hostname 2>/dev/null || echo N/A)',
+      'boot=$(sysctl -n kern.boottime 2>/dev/null | sed -n \'s/.*{ sec = \\([0-9][0-9]*\\).*/\\1/p\')',
+      'now=$(date +%s)',
+      'uptime=$(( now - ${boot:-now} ))',
+      'printf "%s\\n%s\\n%s\\n%s\\n" "$name" "$version" "$host" "$uptime"'
+    ].join('; '));
+
+    if (result && result.ok && result.stdout) {
+      const [name, version, host, uptime] = result.stdout.trim().split('\n');
+      info.osType = name || 'macOS';
+      info.osRelease = version || '';
+      info.hostname = host || 'N/A';
+
+      const totalSec = Math.max(0, Number(uptime) || 0);
+      const days = Math.floor(totalSec / 86400);
+      const hours = Math.floor((totalSec % 86400) / 3600);
+      const minutes = Math.floor((totalSec % 3600) / 60);
+      if (days > 0) info.uptimeFormatted = `${days}d ${hours}h ${minutes}m`;
+      else if (hours > 0) info.uptimeFormatted = `${hours}h ${minutes}m`;
+      else info.uptimeFormatted = `${minutes}m`;
     }
   } catch { /* use defaults */ }
 
