@@ -1,7 +1,7 @@
 {
   "id": "system-monitor",
   "name": "System Monitor",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "entry": "main.js",
   "apiVersion": "1.1",
   "overlay": {
@@ -9,8 +9,10 @@
     "width": "70%",
     "height": "70%",
     "z_order": 50,
-    "resizable": false,
-    "bordered": false,
+    "minimizable": true,
+    "maximizable": true,
+    "resizable": true,
+    "bordered": true,
     "minimized_label": "Monitor",
     "minimized_label_color": "#50C8B4"
   }

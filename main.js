@@ -205,8 +205,162 @@ function formatBytes(bytes) {
   return (bytes / 1e3).toFixed(0) + ' KB';
 }
 
-async function getGpuInfo() {
+async function getGpuInfo(ram) {
   if (platform === 'darwin') return getMacGpuInfo();
+  return getWindowsGpuInfo(ram);
+}
+
+async function getWindowsGpuInfo(ram) {
+  try {
+    // Task Manager gets Windows GPU utilization from the WDDM performance
+    // counters.  The DirectX registry keys provide the LUID -> adapter-name
+    // mapping used by those counters.  Unlike nvidia-smi, this sees Intel/AMD
+    // integrated GPUs and does not wake a sleeping discrete GPU.
+    const command = String.raw`
+$ErrorActionPreference = 'Stop'
+$adapters = @{}
+Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\DirectX' -ErrorAction Stop | ForEach-Object {
+  $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+  if ($p.Description -and $null -ne $p.AdapterLuid) {
+    $raw = [uint64]$p.AdapterLuid
+    $high = [uint32]($raw -shr 32)
+    $low = [uint32]($raw -band [uint64]4294967295)
+    $key = ('luid_0x{0:x8}_0x{1:x8}' -f $high, $low)
+    $dedicatedBytes = 0
+    $sharedBytes = 0
+    if ($null -ne $p.DedicatedVideoMemory) { $dedicatedBytes = [uint64]$p.DedicatedVideoMemory }
+    if ($null -ne $p.SharedSystemMemory) { $sharedBytes = [uint64]$p.SharedSystemMemory }
+    $adapters[$key] = [PSCustomObject]@{
+      Name = [string]$p.Description
+      DedicatedBytes = $dedicatedBytes
+      SharedBytes = $sharedBytes
+    }
+  }
+}
+
+$memory = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory)
+$engines = @(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine)
+$adapterOrder = @{}
+$nextAdapterIndex = 0
+Get-CimInstance Win32_VideoController | ForEach-Object {
+  if ($_.Name -notmatch 'Microsoft Basic|Remote Display|Virtual Display' -and -not $adapterOrder.ContainsKey($_.Name)) {
+    $adapterOrder[$_.Name] = $nextAdapterIndex
+    $nextAdapterIndex++
+  }
+}
+$output = @()
+
+foreach ($mem in $memory) {
+  if ($mem.Name -notmatch '^(luid_0x[0-9a-f]+_0x[0-9a-f]+)_phys_[0-9]+') { continue }
+  $luid = $Matches[1].ToLowerInvariant()
+  $instance = $Matches[0].ToLowerInvariant()
+  $adapter = $adapters[$luid]
+  if ($null -eq $adapter) { continue }
+  if ($adapter.Name -match 'Microsoft Basic|Remote Display|Virtual Display') { continue }
+
+  # A GPU's headline utilization is the busiest engine.  Each engine value is
+  # the sum of its per-process counters, matching Task Manager's calculation.
+  $engineTotals = @{}
+  foreach ($engine in $engines) {
+    $engineName = $engine.Name.ToLowerInvariant()
+    if ($engineName -notlike ('*_' + $instance + '_eng_*')) { continue }
+    if ($engineName -match '_eng_([0-9]+)_engtype_(.*)$') {
+      $engineKey = $Matches[1] + '|' + $Matches[2]
+      $previous = 0.0
+      if ($engineTotals.ContainsKey($engineKey)) { $previous = [double]$engineTotals[$engineKey] }
+      $engineTotals[$engineKey] = $previous + [double]$engine.UtilizationPercentage
+    }
+  }
+
+  $usage = 0.0
+  foreach ($value in $engineTotals.Values) {
+    if ([double]$value -gt $usage) { $usage = [double]$value }
+  }
+  $usage = [Math]::Min(100.0, [Math]::Max(0.0, $usage))
+
+  $usesSharedMemory = ($adapter.Name -match '^Intel.*(Iris|UHD|HD)') -or ($adapter.DedicatedBytes -lt 536870912)
+  if ($usesSharedMemory) {
+    $usedBytes = [uint64]$mem.SharedUsage
+    $totalBytes = [uint64]$adapter.SharedBytes
+    $memoryType = 'Shared'
+  } else {
+    $usedBytes = [uint64]$mem.DedicatedUsage
+    $totalBytes = [uint64]$adapter.DedicatedBytes
+    $memoryType = 'VRAM'
+  }
+
+  $adapterIndex = 999
+  if ($adapterOrder.ContainsKey($adapter.Name)) { $adapterIndex = [int]$adapterOrder[$adapter.Name] }
+
+  $output += [PSCustomObject]@{
+    index = $adapterIndex
+    name = $adapter.Name
+    usagePercent = $usage
+    memUsedMB = [double]$usedBytes / 1MB
+    memTotalMB = [double]$totalBytes / 1MB
+    memoryType = $memoryType
+    active = ($usage -ge 0.1) -or ($usedBytes -ge 16MB)
+    tempC = $null
+    fanPercent = $null
+    powerDrawW = $null
+    powerLimitW = $null
+  }
+}
+
+@($output | Sort-Object index, name) | ConvertTo-Json -Compress
+`;
+
+    const result = await hecaton.process.exec({
+      program: 'powershell',
+      args: ['-NoProfile', '-Command', command],
+      timeout_ms: 7000
+    });
+
+    if (result && result.ok && result.stdout.trim()) {
+      const parsed = JSON.parse(result.stdout.trim());
+      const gpus = (Array.isArray(parsed) ? parsed : [parsed]).map(gpu => ({
+        index: Number.isFinite(Number(gpu.index)) ? Number(gpu.index) : null,
+        name: gpu.name || 'Unknown GPU',
+        usagePercent: Number(gpu.usagePercent) || 0,
+        memUsedMB: Number(gpu.memUsedMB) || 0,
+        // Older DirectX entries can omit shared memory capacity.  Half of
+        // physical RAM is Windows' shared-GPU-memory limit in that case.
+        memTotalMB: Number(gpu.memTotalMB) ||
+          (gpu.memoryType === 'Shared' && ram?.total ? ram.total / 2 / 1048576 : 0),
+        memoryType: gpu.memoryType || 'VRAM',
+        active: Boolean(gpu.active),
+        tempC: null,
+        fanPercent: null,
+        powerDrawW: null,
+        powerLimitW: null,
+      }));
+
+      // nvidia-smi can wake an Optimus dGPU.  Only query it when Windows says
+      // the NVIDIA adapter is already active, then merge its richer sensors.
+      const activeNvidia = gpus.some(gpu => gpu.active && /NVIDIA/i.test(gpu.name));
+      if (activeNvidia) {
+        const nvidiaGpus = await getNvidiaGpuInfo();
+        if (nvidiaGpus) {
+          for (const gpu of gpus) {
+            const details = nvidiaGpus.find(n =>
+              n.name.toLowerCase() === gpu.name.toLowerCase() ||
+              gpu.name.toLowerCase().includes(n.name.toLowerCase()) ||
+              n.name.toLowerCase().includes(gpu.name.toLowerCase())
+            );
+            if (details) {
+              gpu.tempC = details.tempC;
+              gpu.fanPercent = details.fanPercent;
+              gpu.powerDrawW = details.powerDrawW;
+              gpu.powerLimitW = details.powerLimitW;
+            }
+          }
+        }
+      }
+
+      if (gpus.length > 0) return gpus;
+    }
+  } catch { /* fall back to vendor tooling below */ }
+
   return getNvidiaGpuInfo();
 }
 
@@ -396,27 +550,6 @@ function formatPercent(pct) {
   return colorForPercent(clamped) + clamped.toFixed(1) + '%' + ansi.reset;
 }
 
-function drawBox(lines, width) {
-  const top = colors.border + '\u250c' + '\u2500'.repeat(width - 2) + '\u2510' + ansi.reset;
-  const bot = colors.border + '\u2514' + '\u2500'.repeat(width - 2) + '\u2518' + ansi.reset;
-  const result = [top];
-  for (const line of lines) {
-    const plain = line.replace(/\x1b\[[0-9;]*m/g, '');
-    const pad = Math.max(0, width - 2 - plain.length);
-    result.push(
-      colors.border + '\u2502' + ansi.reset + ' ' + line +
-      ' '.repeat(pad > 0 ? pad - 1 : 0) +
-      colors.border + '\u2502' + ansi.reset
-    );
-  }
-  result.push(bot);
-  return result;
-}
-
-function drawSeparator(width) {
-  return colors.separator + '\u2500'.repeat(width - 2) + ansi.reset;
-}
-
 function tempColor(tempC) {
   if (tempC <= 50) return colors.green;
   if (tempC <= 75) return colors.yellow;
@@ -438,8 +571,9 @@ function renderMinimized(state) {
 
     if (d.gpus && d.gpus.length > 0) {
       line += colors.dim + ' | ' + ansi.reset;
+      const activeGpu = d.gpus.find(gpu => gpu.active) || d.gpus[0];
       line += colors.label + 'GPU: ' + ansi.reset;
-      line += formatPercent(d.gpus[0].usagePercent) + ' ' + progressBar(d.gpus[0].usagePercent, 8);
+      line += formatPercent(activeGpu.usagePercent) + ' ' + progressBar(activeGpu.usagePercent, 8);
     }
   }
 
@@ -451,8 +585,150 @@ function renderMinimized(state) {
   process.stdout.write(ansi.moveTo(1, 1) + line + ansi.reset);
 }
 
+function visibleLength(text) {
+  return text.replace(/\x1b\[[0-9;]*m/g, '').length;
+}
+
+function padToWidth(text, width) {
+  return text + ' '.repeat(Math.max(0, width - visibleLength(text)));
+}
+
+function sectionHeader(title, width, suffix = '') {
+  return [
+    colors.title + ansi.bold + title + ansi.reset + suffix,
+    colors.separator + '\u2500'.repeat(Math.max(1, width)) + ansi.reset,
+  ];
+}
+
+function sectionBarWidth(width) {
+  return Math.max(8, Math.min(25, width - 17));
+}
+
+function buildCpuSection(cpu, width) {
+  const lines = sectionHeader('CPU', width);
+  lines.push(
+    colors.label + 'Usage ' + ansi.reset +
+    progressBar(cpu.usagePercent, sectionBarWidth(width)) + '  ' + formatPercent(cpu.usagePercent)
+  );
+  lines.push(
+    colors.label + 'Model: ' + ansi.reset +
+    colors.value + truncateText(cpu.model, Math.max(8, width - 7)) + ansi.reset
+  );
+  lines.push(
+    colors.label + 'Cores: ' + ansi.reset + colors.value + cpu.cores + ansi.reset +
+    colors.dim + '  |  ' + ansi.reset + colors.label + 'Speed: ' + ansi.reset +
+    colors.value + cpu.avgSpeedMHz + ' MHz' + ansi.reset
+  );
+  return lines;
+}
+
+function buildMemorySection(ram, width) {
+  const lines = sectionHeader('Memory', width);
+  lines.push(
+    colors.label + 'Usage ' + ansi.reset +
+    progressBar(ram.usagePercent, sectionBarWidth(width)) + '  ' + formatPercent(ram.usagePercent)
+  );
+  lines.push(
+    colors.label + 'Used: ' + ansi.reset + colors.value + formatBytes(ram.used) + ansi.reset +
+    colors.dim + ' / ' + ansi.reset + colors.value + formatBytes(ram.total) + ansi.reset
+  );
+  lines.push(
+    colors.label + 'Free: ' + ansi.reset + colors.cyan + formatBytes(ram.free) + ansi.reset
+  );
+  return lines;
+}
+
+function buildGpuSection(gpu, fallbackIndex, multiple, width) {
+  const gpuIndex = Number.isFinite(gpu.index) ? gpu.index : fallbackIndex;
+  const title = multiple ? `GPU ${gpuIndex}` : 'GPU';
+  const status = gpu.active === false ? colors.dim + ' (Inactive)' + ansi.reset : '';
+  const lines = sectionHeader(title, width, status);
+
+  lines.push(
+    colors.label + 'Usage ' + ansi.reset +
+    progressBar(gpu.usagePercent, sectionBarWidth(width)) + '  ' + formatPercent(gpu.usagePercent)
+  );
+  lines.push(
+    colors.label + 'Name: ' + ansi.reset +
+    colors.value + truncateText(gpu.name, Math.max(8, width - 6)) + ansi.reset
+  );
+
+  const memPct = gpu.memTotalMB > 0 ? (gpu.memUsedMB / gpu.memTotalMB) * 100 : 0;
+  lines.push(
+    colors.label + (gpu.memoryType || 'VRAM').padEnd(7) + ansi.reset +
+    colors.value + gpu.memUsedMB.toFixed(0) + ansi.reset +
+    colors.dim + ' / ' + ansi.reset + colors.value + gpu.memTotalMB.toFixed(0) + ' MB' + ansi.reset +
+    colors.dim + ' (' + ansi.reset + formatPercent(memPct) + colors.dim + ')' + ansi.reset
+  );
+
+  const details = [];
+  if (gpu.tempC != null) {
+    details.push(
+      colors.label + 'Temp: ' + ansi.reset +
+      tempColor(gpu.tempC) + gpu.tempC.toFixed(0) + '\u00b0C' + ansi.reset
+    );
+  }
+  if (gpu.fanPercent != null) {
+    details.push(
+      colors.label + 'Fan: ' + ansi.reset + colors.value + gpu.fanPercent.toFixed(0) + '%' + ansi.reset
+    );
+  }
+  if (gpu.powerDrawW != null) {
+    const power = gpu.powerLimitW
+      ? gpu.powerDrawW.toFixed(0) + '/' + gpu.powerLimitW.toFixed(0) + 'W'
+      : gpu.powerDrawW.toFixed(0) + 'W';
+    details.push(colors.label + 'Power: ' + ansi.reset + colors.value + power + ansi.reset);
+  }
+  if (details.length > 0) lines.push(details.join(colors.dim + '  |  ' + ansi.reset));
+  return lines;
+}
+
+function buildSystemSection(system, lastRefresh, width) {
+  const lines = sectionHeader('System', width);
+  const os = `${system.osType} ${system.osRelease}`.trim();
+  lines.push(
+    colors.label + 'OS: ' + ansi.reset +
+    colors.value + truncateText(os, Math.max(8, width - 4)) + ansi.reset
+  );
+  lines.push(
+    colors.label + 'Uptime: ' + ansi.reset + colors.value + system.uptimeFormatted + ansi.reset
+  );
+  lines.push(
+    colors.label + 'Host: ' + ansi.reset +
+    colors.value + truncateText(system.hostname, Math.max(8, width - 6)) + ansi.reset
+  );
+  if (lastRefresh) {
+    const ago = Math.floor((Date.now() - lastRefresh) / 1000);
+    lines.push(colors.label + 'Updated: ' + ansi.reset + colors.dim + ago + 's ago' + ansi.reset);
+  }
+  return lines;
+}
+
+function layoutSectionGrid(blocks, contentWidth, columnCount) {
+  const gap = 2;
+  const columnWidth = Math.floor((contentWidth - gap * (columnCount - 1)) / columnCount);
+  const lines = [];
+
+  for (let start = 0; start < blocks.length; start += columnCount) {
+    const row = blocks.slice(start, start + columnCount);
+    const rowHeight = Math.max(...row.map(block => block.length));
+    for (let lineIndex = 0; lineIndex < rowHeight; lineIndex++) {
+      let line = '';
+      for (let column = 0; column < columnCount; column++) {
+        const block = row[column];
+        const text = block?.[lineIndex] || '';
+        line += padToWidth(text, columnWidth);
+        if (column < columnCount - 1) line += ' '.repeat(gap);
+      }
+      lines.push(' ' + line);
+    }
+    if (start + columnCount < blocks.length) lines.push('');
+  }
+  return lines;
+}
+
 function render(state) {
-  const width = Math.min(termCols, 72);
+  const width = Math.max(20, Math.min(termCols, 150));
   const lines = [];
   let buttonLineIdx = -1;
   currentButtons = [];
@@ -471,135 +747,31 @@ function render(state) {
   } else {
     const d = state.data;
 
-    // -- CPU --
-    lines.push('  ' + colors.title + ansi.bold + 'CPU' + ansi.reset);
-    lines.push('  ' + drawSeparator(width - 3));
-    lines.push(
-      '  ' + colors.label + 'Usage ' + ansi.reset +
-      progressBar(d.cpu.usagePercent) + '  ' + formatPercent(d.cpu.usagePercent)
-    );
-    lines.push(
-      '  ' + colors.label + 'Model: ' + ansi.reset +
-      colors.value + truncateText(d.cpu.model, width - 14) + ansi.reset
-    );
-    lines.push(
-      '  ' + colors.label + 'Cores: ' + ansi.reset +
-      colors.value + d.cpu.cores + ansi.reset +
-      colors.dim + '  |  ' + ansi.reset +
-      colors.label + 'Speed: ' + ansi.reset +
-      colors.value + d.cpu.avgSpeedMHz + ' MHz' + ansi.reset
-    );
-    lines.push('');
+    const contentWidth = Math.max(18, width - 2);
+    const minColumnWidth = 44;
+    const columnCount = Math.max(1, Math.min(3, Math.floor((contentWidth + 2) / (minColumnWidth + 2))));
+    const columnWidth = Math.floor((contentWidth - 2 * (columnCount - 1)) / columnCount);
+    const blocks = [
+      buildCpuSection(d.cpu, columnWidth),
+      buildMemorySection(d.ram, columnWidth),
+    ];
 
-    // -- RAM --
-    lines.push('  ' + colors.title + ansi.bold + 'Memory' + ansi.reset);
-    lines.push('  ' + drawSeparator(width - 3));
-    lines.push(
-      '  ' + colors.label + 'Usage ' + ansi.reset +
-      progressBar(d.ram.usagePercent) + '  ' + formatPercent(d.ram.usagePercent)
-    );
-    lines.push(
-      '  ' + colors.label + 'Used:  ' + ansi.reset +
-      colors.value + formatBytes(d.ram.used) + ansi.reset +
-      colors.dim + ' / ' + ansi.reset +
-      colors.value + formatBytes(d.ram.total) + ansi.reset +
-      colors.dim + '  (Free: ' + ansi.reset +
-      colors.cyan + formatBytes(d.ram.free) + ansi.reset +
-      colors.dim + ')' + ansi.reset
-    );
-    lines.push('');
-
-    // -- GPU --
     if (d.gpus && d.gpus.length > 0) {
       for (let gi = 0; gi < d.gpus.length; gi++) {
-        const gpu = d.gpus[gi];
-        const gpuLabel = d.gpus.length > 1 ? `GPU ${gi}` : 'GPU';
-        lines.push('  ' + colors.title + ansi.bold + gpuLabel + ansi.reset);
-        lines.push('  ' + drawSeparator(width - 3));
-
-        lines.push(
-          '  ' + colors.label + 'Usage ' + ansi.reset +
-          progressBar(gpu.usagePercent) + '  ' + formatPercent(gpu.usagePercent)
-        );
-        lines.push(
-          '  ' + colors.label + 'Name:  ' + ansi.reset +
-          colors.value + truncateText(gpu.name, width - 14) + ansi.reset
-        );
-
-        // VRAM
-        const memPct = gpu.memTotalMB > 0 ? (gpu.memUsedMB / gpu.memTotalMB) * 100 : 0;
-        lines.push(
-          '  ' + colors.label + 'VRAM:  ' + ansi.reset +
-          colors.value + gpu.memUsedMB.toFixed(0) + ansi.reset +
-          colors.dim + ' / ' + ansi.reset +
-          colors.value + gpu.memTotalMB.toFixed(0) + ' MB' + ansi.reset +
-          colors.dim + '  (' + ansi.reset +
-          formatPercent(memPct) +
-          colors.dim + ')' + ansi.reset
-        );
-
-        // Temperature, Fan, Power in one line
-        const details = [];
-        if (gpu.tempC != null) {
-          details.push(
-            colors.label + 'Temp: ' + ansi.reset +
-            tempColor(gpu.tempC) + gpu.tempC.toFixed(0) + '\u00b0C' + ansi.reset
-          );
-        }
-        if (gpu.fanPercent != null) {
-          details.push(
-            colors.label + 'Fan: ' + ansi.reset +
-            colors.value + gpu.fanPercent.toFixed(0) + '%' + ansi.reset
-          );
-        }
-        if (gpu.powerDrawW != null) {
-          const powerStr = gpu.powerLimitW
-            ? gpu.powerDrawW.toFixed(0) + '/' + gpu.powerLimitW.toFixed(0) + 'W'
-            : gpu.powerDrawW.toFixed(0) + 'W';
-          details.push(
-            colors.label + 'Power: ' + ansi.reset +
-            colors.value + powerStr + ansi.reset
-          );
-        }
-        if (details.length > 0) {
-          lines.push('  ' + details.join(colors.dim + '  |  ' + ansi.reset));
-        }
-        lines.push('');
+        blocks.push(buildGpuSection(d.gpus[gi], gi, d.gpus.length > 1, columnWidth));
       }
     } else {
-      lines.push('  ' + colors.title + ansi.bold + 'GPU' + ansi.reset);
-      lines.push('  ' + drawSeparator(width - 3));
-      lines.push('  ' + colors.dim + 'No GPU detected (nvidia-smi not found)' + ansi.reset);
-      lines.push('');
+      const noGpu = sectionHeader('GPU', columnWidth);
+      noGpu.push(colors.dim + 'No GPU detected' + ansi.reset);
+      blocks.push(noGpu);
     }
+    blocks.push(buildSystemSection(d.system, state.lastRefresh, columnWidth));
 
-    // -- System --
-    lines.push('  ' + colors.title + ansi.bold + 'System' + ansi.reset);
-    lines.push('  ' + drawSeparator(width - 3));
-    lines.push(
-      '  ' + colors.label + 'OS:     ' + ansi.reset +
-      colors.value + d.system.osType + ' ' + d.system.osRelease + ansi.reset
-    );
-    lines.push(
-      '  ' + colors.label + 'Uptime: ' + ansi.reset +
-      colors.value + d.system.uptimeFormatted + ansi.reset +
-      colors.dim + '  |  ' + ansi.reset +
-      colors.label + 'Host: ' + ansi.reset +
-      colors.value + d.system.hostname + ansi.reset
-    );
-
-    if (state.lastRefresh) {
-      const ago = Math.floor((Date.now() - state.lastRefresh) / 1000);
-      lines.push(
-        '  ' + colors.label + 'Updated: ' + ansi.reset +
-        colors.dim + ago + 's ago' + ansi.reset
-      );
-    }
-
+    lines.push(...layoutSectionGrid(blocks, contentWidth, columnCount));
     lines.push('');
 
     // -- Keyboard --
-    lines.push('  ' + drawSeparator(width - 3));
+    lines.push(' ' + colors.separator + '\u2500'.repeat(contentWidth) + ansi.reset);
     currentButtons = [{ label: '[r] Refresh', action: 'refresh' }];
     buttonLineIdx = lines.length;
     lines.push('  ' + buildHintText(currentButtons));
@@ -607,27 +779,25 @@ function render(state) {
 
   lines.push('');
 
-  const boxed = drawBox(lines, width);
   process.stdout.write(ansi.clear + ansi.hideCursor);
-  const startRow = Math.max(1, Math.floor((termRows - boxed.length) / 2));
+  const startRow = Math.max(1, Math.floor((termRows - lines.length) / 2));
   const startCol = Math.max(1, Math.floor((termCols - width) / 2));
-  for (let i = 0; i < boxed.length; i++) {
-    process.stdout.write(ansi.moveTo(startRow + i, startCol) + colors.bg + boxed[i] + ansi.reset);
+  for (let i = 0; i < lines.length; i++) {
+    process.stdout.write(ansi.moveTo(startRow + i, startCol) + colors.bg + lines[i] + ansi.reset);
   }
 
   // Record clickable areas for mouse support
   clickableAreas = [];
   if (buttonLineIdx >= 0 && currentButtons.length > 0) {
-    const screenRow = startRow + buttonLineIdx + 1;
-    const contentStart = startCol + 2;
+    const screenRow = startRow + buttonLineIdx;
     const plainLine = lines[buttonLineIdx].replace(/\x1b\[[0-9;]*m/g, '');
     for (const btn of currentButtons) {
       const idx = plainLine.indexOf(btn.label);
       if (idx >= 0) {
         clickableAreas.push({
           row: screenRow,
-          colStart: contentStart + idx,
-          colEnd: contentStart + idx + btn.label.length - 1,
+          colStart: startCol + idx,
+          colEnd: startCol + idx + btn.label.length - 1,
           action: btn.action,
         });
       }
@@ -669,7 +839,7 @@ function main() {
     try {
       const cpu = await getCpuUsage();
       const ram = await getRamUsage();
-      const gpus = await getGpuInfo();
+      const gpus = await getGpuInfo(ram);
       const system = await getSystemInfo();
       state.loading = false;
       state.data = { cpu, ram, gpus, system };
